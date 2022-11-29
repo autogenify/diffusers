@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 from typing import Optional
+import re
 
 import torch
 import torch.nn.functional as F
@@ -14,14 +15,13 @@ from torch.utils.data import Dataset
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_scheduler
-from huggingface_hub import HfFolder, Repository, whoami
+from huggingface_hub import HfFolder, Repository, whoami, create_repo, create_commit, upload_folder, CommitOperationAdd
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-
 
 logger = get_logger(__name__)
 
@@ -34,6 +34,12 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_vae_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained vae or vae identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--revision",
@@ -326,6 +332,50 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
+def store_model_on_hf(args):
+    repo_id = "jmdiei/" + re.sub(r"\W+", "-", args.output_dir)
+    readme_text = f"""---
+### **{args.instance_prompt}** on Stable Diffusion via Dreambooth
+#### model by Autogenify
+This your the Stable Diffusion model fine-tuned with the `instance_prompt`: **{args.instance_prompt}** taught to Stable Diffusion with Dreambooth.
+
+You can run your new concept via `diffusers`: [Colab Notebook for Inference](https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/sd_dreambooth_inference.ipynb), [Spaces with the Public Concepts loaded](https://huggingface.co/spaces/sd-dreambooth-library/stable-diffusion-dreambooth-concepts)
+"""
+    # Save the readme to a file
+    readme_file = open("README.md", "w")
+    readme_file.write(readme_text)
+    readme_file.close()
+    # Save the token identifier to a file
+    text_file = open("token_identifier.txt", "w")
+    text_file.write(args.instance_prompt)
+    text_file.close()
+    operations = [
+        CommitOperationAdd(path_in_repo="token_identifier.txt", path_or_fileobj="token_identifier.txt"),
+        CommitOperationAdd(path_in_repo="README.md", path_or_fileobj="README.md"),
+    ]
+    url = create_repo(repo_id, private=True, repo_type="model", exist_ok=True)
+    print(f"url: {url}")
+    create_commit(
+        repo_id=repo_id,
+        operations=operations,
+        commit_message=f"Upload the concept embeds and token",
+        repo_type="model",
+    )
+    upload_folder(folder_path=args.output_dir, path_in_repo="", repo_id=repo_id)
+    # api.upload_folder(folder_path=save_path, path_in_repo="concept_images", repo_id=repo_id, token=hf_token)
+    logger.info(
+        f"""## Your concept was saved successfully. [Click here to access it](https://huggingface.co/{repo_id}) or `{url}`
+""",
+        raw=True,
+    )
+
+    # Remove generated files
+    os.remove("token_identifier.txt")
+    os.remove("README.md")
+    print("repo_id: ", repo_id)
+    return repo_id
+
+
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -390,17 +440,21 @@ def main(args):
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
+            # if args.hub_model_id is None:
+            #     repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
+            # else:
+            #     repo_name = args.hub_model_id
+            # repo = Repository(args.output_dir, clone_from=repo_name)
+            gitignore_fp = os.path.join(args.output_dir, ".gitignore")
+            try:
+                with open(gitignore_fp, "w+") as gitignore:
+                    if "step_*" not in gitignore:
+                        gitignore.write("step_*\n")
+                    if "epoch_*" not in gitignore:
+                        gitignore.write("epoch_*\n")
+            except:
+                logger.warn(f"Could not find {gitignore_fp}.")
 
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
@@ -424,9 +478,9 @@ def main(args):
         revision=args.revision,
     )
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        revision=args.revision,
+        args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
+        subfolder=None if args.pretrained_vae_name_or_path else "vae",
+        revision=None if args.pretrained_vae_name_or_path else args.revision,
     )
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -472,7 +526,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
@@ -648,6 +702,7 @@ def main(args):
         accelerator.wait_for_everyone()
 
     # Create the pipeline using using the trained modules and save it.
+    repo_id = None
     if accelerator.is_main_process:
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -658,9 +713,15 @@ def main(args):
         pipeline.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+            logger.info(f"Uploading model to Hugging Face...")
+
+            repo_id = store_model_on_hf(args)
+
+            # repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
+    logger.info(f"Training complete. Model saved at {args.output_dir}")
+    print(repo_id)
 
 
 if __name__ == "__main__":
